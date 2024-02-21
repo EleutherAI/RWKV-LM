@@ -30,13 +30,15 @@ You can run your model using https://pypi.org/project/rwkv/ (use "rwkv_vocab_v20
 
 lm_eval: https://github.com/BlinkDL/ChatRWKV/blob/main/run_lm_eval.py
 
+chat demo for developers: https://github.com/BlinkDL/ChatRWKV/blob/main/API_DEMO_CHAT.py
+
 ### HOW TO FINETUNE RWKV-5 MODELS ##
 
 Use .jsonl format for your data (see https://huggingface.co/BlinkDL/rwkv-5-world for formats).
 
 Use https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v5/make_data.py to tokenizer it using World tokenizer into binidx, suitable for finetuning World models.
 
-Rename the base checkpoint in your model folder to rwkv-init.pth, and use --n_layer 32 --n_embd 4096 --vocab_size 65536 --lr_init 1e-5 --lr_final 1e-5 for 7B.
+Rename the base checkpoint in your model folder to rwkv-init.pth, and change the training commands to use --n_layer 32 --n_embd 4096 --vocab_size 65536 --lr_init 1e-5 --lr_final 1e-5 for 7B.
 
 ## RWKV: Parallelizable RNN with Transformer-level LLM Performance (pronounced as "RwaKuv" (rʌkuv in IPA), from 4 major params: R W K V)
 
