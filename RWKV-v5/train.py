@@ -8,6 +8,8 @@ logging.basicConfig(level=logging.INFO)
 if __name__ == "__main__":
     from argparse import ArgumentParser
     from pytorch_lightning import Trainer
+    from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+    from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
     import pytorch_lightning as pl
 
@@ -25,8 +27,6 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
 
     parser.add_argument("--ctx_len", default=1024, type=int)
-    parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
-    parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
     parser.add_argument("--epoch_save", default=5, type=int)  # save the model every [epoch_save] "epochs"
 
@@ -104,16 +104,12 @@ if __name__ == "__main__":
     # os.environ["WDS_SHOW_SEED"] = "1"
 
     args.my_timestamp = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
-    args.enable_checkpointing = False
     args.replace_sampler_ddp = False
-    args.logger = False
     args.gradient_clip_val = 1.0
     args.num_sanity_val_steps = 0
     args.check_val_every_n_epoch = int(1e20)
-    args.log_every_n_steps = int(1e20)
-    args.max_epochs = -1  # continue forever
     args.betas = (args.beta1, args.beta2)
-    args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    args.real_bsz = int(args.num_nodes or 1) * int(args.devices or 1) * args.micro_bsz
     os.environ["RWKV_MY_TESTING"] = args.my_testing
     os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
     os.environ["RWKV_HEAD_SIZE_A"] = str(args.head_size_a)
@@ -138,13 +134,8 @@ if __name__ == "__main__":
 
         if magic_prime_bak > 0:
             args.magic_prime = magic_prime_bak
-        if args.my_qa_mask == 2:
-            args.epoch_count = 2 * args.magic_prime // 40320
-        else:
-            args.epoch_count = args.magic_prime // 40320
-
-        args.epoch_steps = 40320 // args.real_bsz
-        assert args.epoch_steps * args.real_bsz == 40320
+        #args.epoch_steps = 40320 // args.real_bsz
+        #assert args.epoch_steps * args.real_bsz == 40320
         # if args.my_pile_stage == 2:
         #     assert args.lr_final == args.lr_init
         if args.my_pile_stage >= 2:  # find latest saved model
@@ -173,8 +164,6 @@ if __name__ == "__main__":
                         args.warmup_steps = 30
             args.epoch_begin = max_p + 1
 
-    samples_per_epoch = args.epoch_steps * args.real_bsz
-    tokens_per_epoch = samples_per_epoch * args.ctx_len
     try:
         deepspeed_version = deepspeed.__version__
     except:
@@ -187,10 +176,6 @@ if __name__ == "__main__":
 # RWKV-5 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}={args.real_bsz}, {args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}
 #
 # Data = {args.data_file} ({args.data_type}), ProjDir = {args.proj_dir}
-#
-# Epoch = {args.epoch_begin} to {args.epoch_begin + args.epoch_count - 1} (will continue afterwards), save every {args.epoch_save} epoch
-#
-# Each "epoch" = {args.epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens
 #
 # Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len
 #
@@ -281,14 +266,21 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
+    ckpt_callback = ModelCheckpoint(every_n_train_steps=4000, save_weights_only=True)
     if pl.__version__[0]=='2':
+        callback = train_callback(args)
+
         trainer = Trainer(accelerator=args.accelerator,strategy=args.strategy,devices=args.devices,num_nodes=args.num_nodes,precision=args.precision,
-        logger=args.logger,callbacks=[train_callback(args)],max_epochs=args.max_epochs,check_val_every_n_epoch=args.check_val_every_n_epoch,num_sanity_val_steps=args.num_sanity_val_steps,
-        log_every_n_steps=args.log_every_n_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val)
+        logger=WandbLogger(args.wandb, project="rnn-hermes") if args.wandb else None,callbacks=[LearningRateMonitor(), ckpt_callback, callback],max_epochs=1,check_val_every_n_epoch=args.check_val_every_n_epoch,num_sanity_val_steps=args.num_sanity_val_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val)
+
+        train_data.global_rank = trainer.global_rank
+        train_data.world_size = trainer.world_size
+        # callback.on_train_epoch_start(trainer, model)
     else:
         trainer = Trainer.from_argparse_args(
             args,
-            callbacks=[train_callback(args)],
+            logger=WandbLogger(args.wandb, project="rnn-hermes") if args.wandb else None,
+            callbacks=[LearningRateMonitor(), ckpt_callback, train_callback(args)],
         )
 
     if trainer.global_rank == 0:
@@ -307,4 +299,4 @@ if __name__ == "__main__":
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
     data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
 
-    trainer.fit(model, data_loader)
+    trainer.fit(model.bfloat16(), data_loader)

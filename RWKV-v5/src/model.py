@@ -2,20 +2,17 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import os, math, gc, importlib
+import functools, os, math, gc, importlib
 import torch
-# torch._C._jit_set_profiling_executor(True)
-# torch._C._jit_set_profiling_mode(True)
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.optim.lr_scheduler import LambdaLR
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-
-# from deepspeed.runtime.fp16.onebit.zoadam import ZeroOneAdam
 
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
@@ -517,6 +514,26 @@ class L2Wrap(torch.autograd.Function):
         gy.scatter_(-1, ids, maxx * factor)
         return (grad_output, gy)
 
+# Copied from HuggingFace transformers
+def _get_cosine_schedule_with_warmup_lr_lambda(
+    current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: float
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+
+def get_cosine_schedule_with_warmup(
+    optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5, last_epoch: int = -1
+):
+    lr_lambda = functools.partial(
+        _get_cosine_schedule_with_warmup_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        num_cycles=num_cycles,
+    )
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 class RWKV(pl.LightningModule):
     def __init__(self, args):
@@ -609,13 +626,18 @@ class RWKV(pl.LightningModule):
         if args.weight_decay > 0:
             optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
             if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
+                opt = DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
+            opt = FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
         else:
             if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
-        # return ZeroOneAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
+                opt = DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
+            opt = FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+        
+        steps = self.args.my_exit_tokens // (self.args.micro_bsz * self.trainer.world_size * self.args.ctx_len)
+        return [opt], [{
+            "scheduler": get_cosine_schedule_with_warmup(opt, self.args.warmup_steps, steps),
+            "interval": "step"
+        }]
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -708,6 +730,7 @@ class RWKV(pl.LightningModule):
                 #             ccc += 1
                 #     print('rank', self.global_rank, 'loss', loss.item(), 'lavg', sss / ccc)#, 'tmp', tmp, 'input', idx)
 
+        self.log("loss", loss)
         return L2Wrap.apply(loss, logits)
 
     def training_step_end(self, batch_parts):

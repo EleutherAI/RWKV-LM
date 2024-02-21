@@ -46,8 +46,6 @@ class MyDataset(Dataset):
 
             if args.my_pile_stage > 0:
                 # assert self.data_size == 332115325534 and self.vocab_size == 50277
-                self.samples_per_epoch = args.epoch_steps * args.real_bsz
-                assert self.samples_per_epoch == 40320
                 rank_zero_info(f"########## Pile 20b-tokenized stage {args.my_pile_stage} ##########")
                 dataset_slot = self.data_size // args.ctx_len
                 if args.my_pile_stage != 4:
@@ -97,14 +95,12 @@ class MyDataset(Dataset):
             self.itos = {i: ch for i, ch in enumerate(unique)}
 
     def __len__(self):
-        return self.args.epoch_steps * self.args.micro_bsz
+        return self.data_size // (self.args.ctx_len * int(self.args.devices))
 
     def __getitem__(self, idx):
         args = self.args
         rank = self.global_rank
-        epoch = self.real_epoch
         world_size = self.world_size
-        # print(f"epoch {epoch} idx {idx} rank {rank}/{world_size}")
 
         if args.data_type == "uint16":
             i = np.random.randint(0, self.data_size-1)
@@ -118,7 +114,7 @@ class MyDataset(Dataset):
             data = self.data
 
             if args.my_pile_stage > 0:
-                ii = 1 + epoch * self.samples_per_epoch + (idx * world_size) + rank
+                ii = 1 + (idx * world_size) + rank
 
                 if args.my_qa_mask > 0:
                     ii_orig = ii
@@ -142,7 +138,6 @@ class MyDataset(Dataset):
                         factor = int(magic_prime * factor)
                         i = ((factor * ii * ii * ii) % magic_prime) * ctx_len
                         i = i + args.my_pile_shift
-                # print(f"epoch {epoch} idx {idx} rank {rank}/{world_size} ii {ii} pos {round(i / self.data_size, 3)}")
             else:
                 # cheat: pick a random spot in dataset
                 i = np.random.randint(0, self.data_size - req_len)
